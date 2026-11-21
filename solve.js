@@ -100,17 +100,17 @@ export function run(input) {
     let ended = END;
     let quoted = false;
     let value = '';
+    let fi = 0;
     for (;;) {
-      if (nextLf < pos) {
-        const t = text.indexOf('\n', pos);
-        nextLf = t < 0 ? n : t;
-      }
-      if (nextCr < pos) {
-        const t = text.indexOf('\r', pos);
-        nextCr = t < 0 ? n : t;
-      }
-
       if (text.charCodeAt(pos) === 34) {
+        if (nextLf < pos) {
+          const t = text.indexOf('\n', pos);
+          nextLf = t < 0 ? n : t;
+        }
+        if (nextCr < pos) {
+          const t = text.indexOf('\r', pos);
+          nextCr = t < 0 ? n : t;
+        }
         // A quoted field: find the closing quote (the first quote not followed by another), then reread.
         quoted = true;
         const openLine = line;
@@ -188,11 +188,27 @@ export function run(input) {
           }
         }
       } else {
-        // An unquoted field: the first comma, LF or CR at or after pos ends it.
+        // An unquoted field: the first comma, LF or CR at or after pos ends it. A comma before the next line
+        // break (the common case) needs neither line-break cursor refreshed.
         quoted = false;
         const start = pos;
         let ci = text.indexOf(',', pos);
         if (ci < 0) ci = n;
+        if (ci < nextLf && ci < nextCr) {
+          value = text.slice(start, ci);
+          pos = ci + 1;
+          ended = COMMA;
+          fields[fi++] = value;
+          continue;
+        }
+        if (nextLf < pos) {
+          const t = text.indexOf('\n', pos);
+          nextLf = t < 0 ? n : t;
+        }
+        if (nextCr < pos) {
+          const t = text.indexOf('\r', pos);
+          nextCr = t < 0 ? n : t;
+        }
         let end = ci;
         if (nextLf < end) end = nextLf;
         if (nextCr < end) end = nextCr;
@@ -223,7 +239,7 @@ export function run(input) {
           }
         }
       }
-      fields.push(value);
+      fields[fi++] = value;
       if (ended !== COMMA) break;
     }
     return { fields, quoted };

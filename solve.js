@@ -1,15 +1,13 @@
 // A fast drop-in for csv-reader 1.0.0: run(input) reads {text, header} once, left to right, and answers
 // {columns, rows, errors} exactly as the house reference does.
 //
-// One cursor walks the text. A record that holds no quote before its first line break, and whose line break is a
-// plain LF or a CRLF (no stray CR), is the common case and the cheap one: its fields are one native substring and
-// one native split, so the per-field work runs in C++ rather than in a JS loop. Only a record that can hold a
-// quoted field, a stray CR or junk takes the field-at-a-time reader below, which is the house reference's own
-// reading spelled out: a plain field is one native search for its comma plus a substring, with the next LF and the
-// next CR remembered between fields so no scan repeats, and the rare broken shapes (a stray CR, junk after a
-// closing quote, an unterminated quote) stitch pieces together on a slow path.
-//
-// Character codes used below: 10 LF, 13 CR, 34 ", 44 ,, 0xFEFF BOM.
+// solveFile() is the fast path main.ts uses on the case set: it reads cases.json's bytes and transduces them into
+// answers.json's bytes. The input JSON already holds every field value in its JSON-escaped form, so a field that
+// needs no CSV unquoting is copied byte for byte and the output needs no re-escaping; only a quoted field ("" -> ",
+// CRLF or a lone CR -> LF), a stray CR or a junk tail is rewritten as it is emitted. A JSON escape that is not
+// canonical (\uXXXX, \/) falls back: this path returns null and the caller answers with run() over the parsed values.
+
+import { openSync, readSync, closeSync, fstatSync } from 'node:fs';
 
 const COMMA = 1;
 const LINE_BREAK = 2;
@@ -325,4 +323,292 @@ export function run(input) {
   }
 
   return { columns: header ? (columns === null ? [] : columns) : null, rows, errors };
+}
+
+
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Fast path: cases.json bytes -> answers.json bytes.
+// ---------------------------------------------------------------------------------------------------------------------
+
+const COM = 44, QUO = 34, BS = 92, NL = 110, CR = 114, UU = 117, SL = 47;
+
+const C_COLUMNS = Buffer.from('{"columns":');
+const C_NULLROWS = Buffer.from('null,"rows":[');
+const C_ROWS = Buffer.from(',"rows":[');
+const C_ERRS = Buffer.from('],"errors":[');
+const C_SHORT = '{"code":"short_row","line":';
+const C_LONG = '{"code":"long_row","line":';
+const C_STRAY = '{"code":"stray_cr","line":';
+const C_QJUNK = '{"code":"quote_junk","line":';
+const C_UNTERM = '{"code":"unterminated_quote","line":';
+
+const HDR = Buffer.from('\",\"h');
+let B, CAP, E, P, O, LINE, RL, RR;
+let EB = Buffer.allocUnsafe(1 << 20), EO = 0, EN = 0;
+let FEND = new Int32Array(1 << 12);
+let ANY = false;
+
+function putConst(o, c) {
+  const n = c.length;
+  for (let i = 0; i < n; i++) B[o + i] = c[i];
+  return o + n;
+}
+
+function wStr(eo, s) {
+  for (let i = 0; i < s.length; i++) EB[eo++] = s.charCodeAt(i);
+  return eo;
+}
+function wInt(eo, v) {
+  if (v < 10) { EB[eo++] = 48 + v; return eo; }
+  const st = eo;
+  while (v >= 10) { const q = (v / 10) | 0; EB[eo++] = 48 + (v - q * 10); v = q; }
+  EB[eo++] = 48 + v;
+  let a = st, z = eo - 1;
+  while (a < z) { const t = EB[a]; EB[a++] = EB[z]; EB[z--] = t; }
+  return eo;
+}
+function errHead(c, line, row) {
+  let eo = EO;
+  if (EN > 0) EB[eo++] = COM;
+  EN++;
+  eo = wStr(eo, c);
+  eo = wInt(eo, line);
+  eo = wStr(eo, ',"row":');
+  if (row < 0) eo = wStr(eo, 'null'); else eo = wInt(eo, row);
+  return eo;
+}
+function errSimple(c) {
+  let eo = errHead(c, RL, RR);
+  EB[eo++] = 125;
+  EO = eo;
+}
+
+function readUnquoted() {
+  const b = B, e = E;
+  let p = P, o = O, seg = p;
+  for (;;) {
+    while (p < e) { const c = b[p]; if (c === COM || c === BS) break; p++; }
+    if (p >= e) {
+      if (p > seg) { if (o + p - seg > CAP) return -1; b.copyWithin(o, seg, p); o += p - seg; ANY = true; }
+      P = p; O = o; return 3;
+    }
+    if (b[p] === COM) {
+      if (p > seg) { if (o + p - seg > CAP) return -1; b.copyWithin(o, seg, p); o += p - seg; ANY = true; }
+      P = p + 1; O = o; return 1;
+    }
+    const c2 = b[p + 1];
+    if (c2 === NL) {
+      if (p > seg) { if (o + p - seg > CAP) return -1; b.copyWithin(o, seg, p); o += p - seg; ANY = true; }
+      P = p + 2; O = o; LINE++; return 2;
+    }
+    if (c2 === CR) {
+      if (p + 4 <= e && b[p + 2] === BS && b[p + 3] === NL) {
+        if (p > seg) { if (o + p - seg > CAP) return -1; b.copyWithin(o, seg, p); o += p - seg; ANY = true; }
+        P = p + 4; O = o; LINE++; return 2;
+      }
+      if (p > seg) { if (o + p - seg > CAP) return -1; b.copyWithin(o, seg, p); o += p - seg; ANY = true; }
+      O = o;
+      errSimple(C_STRAY);
+      p += 2; seg = p;
+      continue;
+    }
+    if (c2 === UU || c2 === SL) return -1;
+    p += 2; ANY = true;
+  }
+}
+
+function readQuoted(vStart) {
+  const b = B, e = E;
+  const openLine = LINE;
+  let p = P + 2, o = vStart, seg = p;
+  for (;;) {
+    while (p < e) { if (b[p] === BS) break; p++; }
+    if (p >= e) break;
+    const c2 = b[p + 1];
+    if (c2 === QUO) {
+      if (p + 4 <= e && b[p + 2] === BS && b[p + 3] === QUO) {
+        if (p > seg) { if (o + p - seg > CAP) return -1; b.copyWithin(o, seg, p); o += p - seg; }
+        b[o++] = BS; b[o++] = QUO;
+        p += 4; seg = p;
+        continue;
+      }
+      if (p > seg) { if (o + p - seg > CAP) return -1; b.copyWithin(o, seg, p); o += p - seg; }
+      p += 2;
+      if (p >= e) { P = p; O = o; return 3; }
+      const c = b[p];
+      if (c === COM) { P = p + 1; O = o; return 1; }
+      if (c === BS) {
+        const d = b[p + 1];
+        if (d === NL) { P = p + 2; O = o; LINE++; return 2; }
+        if (d === CR && p + 4 <= e && b[p + 2] === BS && b[p + 3] === NL) { P = p + 4; O = o; LINE++; return 2; }
+      }
+      P = p; O = o; ANY = false;
+      const ended = readUnquoted();
+      if (ANY) errSimple(C_QJUNK);
+      return ended;
+    }
+    if (c2 === NL) { p += 2; LINE++; continue; }
+    if (c2 === CR) {
+      if (p > seg) { if (o + p - seg > CAP) return -1; b.copyWithin(o, seg, p); o += p - seg; }
+      if (o + 4 > CAP) return -1;
+      b[o++] = BS; b[o++] = NL;
+      LINE++;
+      if (p + 4 <= e && b[p + 2] === BS && b[p + 3] === NL) p += 4; else p += 2;
+      seg = p;
+      continue;
+    }
+    if (c2 === UU || c2 === SL) return -1;
+    p += 2;
+  }
+  O = vStart;
+  if (vStart + 2 > CAP) return -1;
+  B[O++] = BS; B[O++] = QUO;
+  LINE = openLine;
+  P = P + 2;
+  errSimple(C_UNTERM);
+  return readUnquoted();
+}
+
+function parseCase(ts, te, header, o0) {
+  P = ts; E = te; LINE = 1; O = o0;
+  if (E - P >= 3 && B[P] === 0xEF && B[P + 1] === 0xBB && B[P + 2] === 0xBF) P += 3;
+
+  O = putConst(O, C_COLUMNS);
+  if (!header) O = putConst(O, C_NULLROWS);
+
+  let width = -1, columnsDone = false, rowCount = 0;
+
+  for (;;) {
+    for (;;) {
+      if (P >= E) break;
+      const c = B[P];
+      if (c === BS) {
+        const c2 = B[P + 1];
+        if (c2 === NL) { P += 2; LINE++; continue; }
+        if (c2 === CR && P + 4 <= E && B[P + 2] === BS && B[P + 3] === NL) { P += 4; LINE++; continue; }
+      }
+      break;
+    }
+    if (P >= E) break;
+
+    RL = LINE;
+    const isHeader = header && !columnsDone;
+    RR = isHeader ? -1 : rowCount;
+
+    const recStart = O;
+    if (!isHeader && rowCount > 0) B[O++] = COM;
+
+    B[O++] = 91;
+    let nf = 0;
+    let lastQuoted = false;
+    let firstEmpty = true;
+    let ended;
+    do {
+      if (nf > 0) B[O++] = COM;
+      B[O++] = QUO;
+      const vs = O;
+      const q = B[P] === BS && B[P + 1] === QUO;
+      lastQuoted = q;
+      ended = q ? readQuoted(vs) : readUnquoted();
+      if (ended < 0) return -1;
+      if (nf === 0 && O > vs) firstEmpty = false;
+      B[O++] = QUO;
+      if (nf >= FEND.length) { const nf2 = new Int32Array(FEND.length * 2); nf2.set(FEND); FEND = nf2; }
+      FEND[nf] = O;
+      nf++;
+    } while (ended === 1);
+
+    if (nf === 1 && firstEmpty && !lastQuoted) { O = recStart; continue; }
+
+    if (isHeader) {
+      width = nf;
+      columnsDone = true;
+      B[O++] = 93;
+      O = putConst(O, C_ROWS);
+    } else {
+      if (width < 0) width = nf;
+      if (nf < width) {
+        let eo = errHead(C_SHORT, RL, RR);
+        eo = wStr(eo, ',"fields":');
+        eo = wInt(eo, nf);
+        EB[eo++] = 125; EO = eo;
+        for (let k = nf; k < width; k++) { B[O++] = COM; B[O++] = QUO; B[O++] = QUO; }
+      } else if (nf > width) {
+        const from = FEND[width - 1] + 1;
+        let eo = errHead(C_LONG, RL, RR);
+        eo = wStr(eo, ',"extra":[');
+        B.copy(EB, eo, from, O);
+        eo += O - from;
+        EB[eo++] = 93; EB[eo++] = 125; EO = eo;
+        O = FEND[width - 1];
+      }
+      rowCount++;
+      B[O++] = 93;
+    }
+  }
+
+  if (header && !columnsDone) {
+    B[O++] = 91; B[O++] = 93;
+    O = putConst(O, C_ROWS);
+  }
+  O = putConst(O, C_ERRS);
+  EB.copy(B, O, 0, EO); O += EO;
+  B[O++] = 93; B[O++] = 125;
+  EO = 0;
+  return O;
+}
+
+/** Reads a cases.json file's bytes and transduces them into answers.json's bytes, or null when the file is not the
+ * shape this path can answer exactly (the caller then falls back to run()). */
+export function solveFile(path) {
+  const fd = openSync(path, 'r');
+  try {
+    const size = fstatSync(fd).size;
+    const outbase = ((size + 7) & ~7) + 16;
+    CAP = outbase + Math.ceil(size * 2.75) + (1 << 23);
+    B = Buffer.allocUnsafe(CAP);
+    let off = 0;
+    while (off < size) {
+      const got = readSync(fd, B, off, size - off, off);
+      if (got <= 0) return null;
+      off += got;
+    }
+    return solveSlice(B, size, outbase);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** The same transduction over a Buffer already holding cases.json (tests). */
+export function solveBuffer(raw) {
+  const size = raw.length;
+  const outbase = ((size + 7) & ~7) + 16;
+  CAP = outbase + Math.ceil(size * 2.75) + (1 << 23);
+  B = Buffer.allocUnsafe(CAP);
+  raw.copy(B, 0, 0, size);
+  return solveSlice(B, size, outbase);
+}
+
+function solveSlice(B, N, outbase) {
+  let o = outbase;
+  B[o++] = 91;
+  let searchFrom = 0, first = true;
+  for (;;) {
+    const tpos = B.indexOf('"text":"', searchFrom);
+    if (tpos < 0) break;
+    const ts = tpos + 8;
+    const hk = B.indexOf(HDR, ts);
+    if (hk < 0) return null;
+    const hv = B[hk + 11];
+    if (hv !== 0x74 && hv !== 0x66) return null;
+    if (!first) B[o++] = COM;
+    first = false;
+    EO = 0; EN = 0;
+    o = parseCase(ts, hk, hv === 0x74, o);
+    if (o < 0) return null;
+    searchFrom = hk + 12;
+  }
+  B[o++] = 93;
+  return B.subarray(outbase, o);
 }

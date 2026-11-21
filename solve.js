@@ -386,54 +386,39 @@ function errSimple(c) {
 
 function readUnquoted() {
   const b = B, e = E;
-  let p = P, o = O, seg = p;
+  let p = P, o = O;
   for (;;) {
-    while (p < e) { const c = b[p]; if (c === COM || c === BS) break; p++; }
-    if (p >= e) {
-      if (p > seg) { if (o + p - seg > CAP) return -1; b.copyWithin(o, seg, p); o += p - seg; ANY = true; }
-      P = p; O = o; return 3;
-    }
-    if (b[p] === COM) {
-      if (p > seg) { if (o + p - seg > CAP) return -1; b.copyWithin(o, seg, p); o += p - seg; ANY = true; }
-      P = p + 1; O = o; return 1;
-    }
+    while (p < e) { const c = b[p]; if (c === COM || c === BS) break; b[o++] = c; p++; ANY = true; }
+    if (p >= e) { P = p; O = o; return 3; }
+    if (b[p] === COM) { P = p + 1; O = o; return 1; }
     const c2 = b[p + 1];
-    if (c2 === NL) {
-      if (p > seg) { if (o + p - seg > CAP) return -1; b.copyWithin(o, seg, p); o += p - seg; ANY = true; }
-      P = p + 2; O = o; LINE++; return 2;
-    }
+    if (c2 === NL) { P = p + 2; O = o; LINE++; return 2; }
     if (c2 === CR) {
-      if (p + 4 <= e && b[p + 2] === BS && b[p + 3] === NL) {
-        if (p > seg) { if (o + p - seg > CAP) return -1; b.copyWithin(o, seg, p); o += p - seg; ANY = true; }
-        P = p + 4; O = o; LINE++; return 2;
-      }
-      if (p > seg) { if (o + p - seg > CAP) return -1; b.copyWithin(o, seg, p); o += p - seg; ANY = true; }
+      if (p + 4 <= e && b[p + 2] === BS && b[p + 3] === NL) { P = p + 4; O = o; LINE++; return 2; }
       O = o;
       errSimple(C_STRAY);
-      p += 2; seg = p;
+      p += 2;
       continue;
     }
     if (c2 === UU || c2 === SL) return -1;
-    p += 2; ANY = true;
+    b[o++] = BS; b[o++] = c2; p += 2; ANY = true;
   }
 }
 
 function readQuoted(vStart) {
   const b = B, e = E;
   const openLine = LINE;
-  let p = P + 2, o = vStart, seg = p;
+  let p = P + 2, o = vStart;
   for (;;) {
-    while (p < e) { if (b[p] === BS) break; p++; }
+    while (p < e) { const c0 = b[p]; if (c0 === BS) break; b[o++] = c0; p++; }
     if (p >= e) break;
     const c2 = b[p + 1];
     if (c2 === QUO) {
       if (p + 4 <= e && b[p + 2] === BS && b[p + 3] === QUO) {
-        if (p > seg) { if (o + p - seg > CAP) return -1; b.copyWithin(o, seg, p); o += p - seg; }
         b[o++] = BS; b[o++] = QUO;
-        p += 4; seg = p;
+        p += 4;
         continue;
       }
-      if (p > seg) { if (o + p - seg > CAP) return -1; b.copyWithin(o, seg, p); o += p - seg; }
       p += 2;
       if (p >= e) { P = p; O = o; return 3; }
       const c = b[p];
@@ -448,18 +433,15 @@ function readQuoted(vStart) {
       if (ANY) errSimple(C_QJUNK);
       return ended;
     }
-    if (c2 === NL) { p += 2; LINE++; continue; }
+    if (c2 === NL) { b[o++] = BS; b[o++] = NL; p += 2; LINE++; continue; }
     if (c2 === CR) {
-      if (p > seg) { if (o + p - seg > CAP) return -1; b.copyWithin(o, seg, p); o += p - seg; }
-      if (o + 4 > CAP) return -1;
       b[o++] = BS; b[o++] = NL;
       LINE++;
       if (p + 4 <= e && b[p + 2] === BS && b[p + 3] === NL) p += 4; else p += 2;
-      seg = p;
       continue;
     }
     if (c2 === UU || c2 === SL) return -1;
-    p += 2;
+    b[o++] = BS; b[o++] = c2; p += 2;
   }
   O = vStart;
   if (vStart + 2 > CAP) return -1;

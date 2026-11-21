@@ -3,12 +3,19 @@
 // and in the cases' order. Outside a container MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in for /input and
 // /output.
 
-import { readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, openSync, readFileSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { setFlagsFromString } from 'node:v8';
 
-// V8's incremental marking off, set before solve.js is imported so all of its work runs under it.
+// V8's incremental marking off, set before solve.js is imported so all of its work runs under it. The reader is
+// one hot function: optimizing it once, up front, and keeping that code (no lazy OSR re-compiles, no compiling on
+// another thread that a one-CPU sandbox has no room for) is worth far more than the short warm-up it costs. The
+// young generation is sized so the strings one case's answer holds are allocated, not copied, by the scavenger.
 setFlagsFromString('--no-incremental-marking');
+setFlagsFromString('--no-use-osr');
+setFlagsFromString('--no-concurrent-recompilation');
+setFlagsFromString('--min-semi-space-size=32');
+setFlagsFromString('--max-semi-space-size=32');
 
 /** solve.js, imported by its URL (a .js module carries no types) and typed by its contract. */
 const { run } = (await import(new URL('./solve.js', import.meta.url).href)) as { run: (input: unknown) => unknown };
@@ -79,10 +86,39 @@ function warmText(): string {
   return text;
 }
 
-const WARM = warmText();
-for (let i = 0; i < 6; i += 1) run({ text: WARM, header: (i & 1) === 0 });
+const PROFILE = process.env.MAKEFUN_PROFILE === '1';
+const mark = (): number => (PROFILE ? process.cpuUsage().user + process.cpuUsage().system : 0);
+let t0 = mark();
 
-const cases = JSON.parse(readFileSync(join(INPUT_DIR, 'cases.json'), 'utf8')) as { id: string; input: unknown }[];
-const answers: unknown[] = [];
-for (const c of cases) answers.push(run(c.input));
-writeFileSync(join(OUTPUT_DIR, 'answers.json'), JSON.stringify(answers));
+const WARM = warmText();
+const WARM_ITERS = Number(process.env.MAKEFUN_WARM_ITERS ?? 6);
+for (let i = 0; i < WARM_ITERS; i += 1) run({ text: WARM, header: (i & 1) === 0 });
+
+let t1 = mark();
+const raw = readFileSync(join(INPUT_DIR, 'cases.json'), 'utf8');
+const cases = JSON.parse(raw) as { id: string; input: unknown }[];
+let t2 = mark();
+
+// One answer at a time: each case is read, written as its JSON and dropped before the next, so the heap holds
+// one case's strings rather than six sets of them and the scavenger has little live data to copy.
+const fd = openSync(join(OUTPUT_DIR, 'answers.json'), 'w');
+let work = 0;
+let write = 0;
+const per: number[] = [];
+for (let i = 0; i < cases.length; i += 1) {
+  let t = mark();
+  const a = run(cases[i]!.input);
+  const tp = mark() - t;
+  const s = (i === 0 ? '[' : ',') + JSON.stringify(a) + (i === cases.length - 1 ? ']' : '');
+  if (PROFILE) {
+    work += mark() - t;
+    per.push(tp);
+  }
+  t = mark();
+  const buf = Buffer.from(s, 'utf8');
+  let off = 0;
+  while (off < buf.length) off += writeSync(fd, buf, off);
+  if (PROFILE) write += mark() - t;
+}
+closeSync(fd);
+if (PROFILE) process.stderr.write(JSON.stringify({ warm: t1 - t0, readParse: t2 - t1, per, work, write, all: mark() }) + '\n');

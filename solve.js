@@ -1,9 +1,13 @@
 // A fast drop-in for csv-reader 1.0.0: run(input) reads {text, header} once, left to right, and answers
 // {columns, rows, errors} exactly as the house reference does.
 //
-// One cursor walks the text. A plain field is one native search for its comma plus a substring, with the next
-// LF and the next CR remembered between fields so no scan repeats; only the rare broken shapes (a stray CR,
-// junk after a closing quote, an unterminated quote) take a slow path that stitches pieces together.
+// One cursor walks the text. A record that holds no quote before its first line break, and whose line break is a
+// plain LF or a CRLF (no stray CR), is the common case and the cheap one: its fields are one native substring and
+// one native split, so the per-field work runs in C++ rather than in a JS loop. Only a record that can hold a
+// quoted field, a stray CR or junk takes the field-at-a-time reader below, which is the house reference's own
+// reading spelled out: a plain field is one native search for its comma plus a substring, with the next LF and the
+// next CR remembered between fields so no scan repeats, and the rare broken shapes (a stray CR, junk after a
+// closing quote, an unterminated quote) stitch pieces together on a slow path.
 //
 // Character codes used below: 10 LF, 13 CR, 34 ", 44 ,, 0xFEFF BOM.
 
@@ -89,29 +93,14 @@ export function run(input) {
     return { value: parts.join(''), ended, added };
   }
 
-  while (pos < n) {
-    // Lines left with no characters are no record.
-    let c0 = text.charCodeAt(pos);
-    if (c0 === 10) {
-      pos += 1;
-      line += 1;
-      continue;
-    }
-    if (c0 === 13 && text.charCodeAt(pos + 1) === 10) {
-      pos += 2;
-      line += 1;
-      continue;
-    }
-
-    recordLine = line;
-    recordRow = header && columns === null ? null : rows.length;
-
+  // The field-at-a-time reader, for a record the record-level fast path below cannot take. Returns the record's
+  // fields and whether its last field was quoted (a record that held only stray CRs is left with no characters).
+  function readFields() {
     const fields = [];
-    let ended;
-    let quotedLast = false;
-    let value;
-
-    while (true) {
+    let ended = END;
+    let quoted = false;
+    let value = '';
+    for (;;) {
       if (nextLf < pos) {
         const t = text.indexOf('\n', pos);
         nextLf = t < 0 ? n : t;
@@ -123,10 +112,9 @@ export function run(input) {
 
       if (text.charCodeAt(pos) === 34) {
         // A quoted field: find the closing quote (the first quote not followed by another), then reread.
-        quotedLast = true;
-        const open = pos;
+        quoted = true;
         const openLine = line;
-        const start = open + 1;
+        const start = pos + 1;
         const q0 = start < n ? text.indexOf('"', start) : -1;
         let q = q0;
         while (q >= 0 && text.charCodeAt(q + 1) === 34) q = text.indexOf('"', q + 2);
@@ -135,7 +123,7 @@ export function run(input) {
           pos = start;
           line = openLine;
           errors.push({ code: 'unterminated_quote', line: recordLine, row: recordRow });
-          const r = slowUnquoted(pos, '"');
+          const r = slowUnquoted(start, '"');
           value = r.value;
           ended = r.ended;
         } else {
@@ -201,7 +189,7 @@ export function run(input) {
         }
       } else {
         // An unquoted field: the first comma, LF or CR at or after pos ends it.
-        quotedLast = false;
+        quoted = false;
         const start = pos;
         let ci = text.indexOf(',', pos);
         if (ci < 0) ci = n;
@@ -212,33 +200,99 @@ export function run(input) {
           value = text.slice(start);
           pos = n;
           ended = END;
-        } else if (end === ci) {
-          value = text.slice(start, end);
-          pos = end + 1;
-          ended = COMMA;
-        } else if (end === nextLf) {
-          // A CR just before an LF is the line break, and was the minimum instead.
-          value = text.slice(start, end);
-          pos = end + 1;
-          line += 1;
-          ended = LINE_BREAK;
-        } else if (text.charCodeAt(end + 1) === 10) {
-          value = text.slice(start, end);
-          pos = end + 2;
-          line += 1;
-          ended = LINE_BREAK;
         } else {
-          const r = slowUnquoted(start, '');
-          value = r.value;
-          ended = r.ended;
+          const ec = text.charCodeAt(end);
+          if (ec === 44) {
+            value = text.slice(start, end);
+            pos = end + 1;
+            ended = COMMA;
+          } else if (ec === 10) {
+            value = text.slice(start, end);
+            pos = end + 1;
+            line += 1;
+            ended = LINE_BREAK;
+          } else if (text.charCodeAt(end + 1) === 10) {
+            value = text.slice(start, end);
+            pos = end + 2;
+            line += 1;
+            ended = LINE_BREAK;
+          } else {
+            const r = slowUnquoted(start, '');
+            value = r.value;
+            ended = r.ended;
+          }
         }
       }
       fields.push(value);
       if (ended !== COMMA) break;
     }
+    return { fields, quoted };
+  }
+
+  while (pos < n) {
+    // Lines left with no characters are no record.
+    const c0 = text.charCodeAt(pos);
+    if (c0 === 10) {
+      pos += 1;
+      line += 1;
+      continue;
+    }
+    if (c0 === 13 && text.charCodeAt(pos + 1) === 10) {
+      pos += 2;
+      line += 1;
+      continue;
+    }
+
+    recordLine = line;
+    recordRow = header && columns === null ? null : rows.length;
+
+    let fields = null;
+    let lastQuoted = false;
+
+    // The record-level fast path. The first line break at or after pos ends the record when no quote comes before
+    // it (no quoted field can be open) and that break is a plain LF or a CRLF (no stray CR): then every field is
+    // one comma-separated run of the record's characters, so one substring and one native split answer it. If the
+    // first CR is not the LF's own CR, there is a stray CR and the record goes to the slow reader.
+    if (nextLf < pos) {
+      const t = text.indexOf('\n', pos);
+      nextLf = t < 0 ? n : t;
+    }
+    if (nextCr < pos) {
+      const t = text.indexOf('\r', pos);
+      nextCr = t < 0 ? n : t;
+    }
+    const lf = nextLf;
+    const cr = nextCr;
+    let end;
+    let after = -1;
+    if (lf === n && cr === n) {
+      end = n;
+      after = n;
+    } else if (lf < cr) {
+      end = lf;
+      after = lf + 1;
+    } else if (lf < n && cr === lf - 1) {
+      end = cr;
+      after = lf + 1;
+    } else {
+      end = -1;
+    }
+    if (end >= 0) {
+      const q = text.indexOf('"', pos);
+      if (q < 0 || q >= end) {
+        fields = text.slice(pos, end).split(',');
+        pos = after;
+        if (after > end) line += 1;
+      }
+    }
+    if (fields === null) {
+      const r = readFields();
+      fields = r.fields;
+      lastQuoted = r.quoted;
+    }
 
     // A line that held only stray CRs is left with no characters: no record (its stray_cr errors stay).
-    if (fields.length === 1 && fields[0] === '' && !quotedLast) continue;
+    if (fields.length === 1 && fields[0] === '' && !lastQuoted) continue;
 
     if (width < 0) width = fields.length;
     if (header && columns === null) {
